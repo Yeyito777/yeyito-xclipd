@@ -4,13 +4,24 @@
 #include <signal.h>
 #include <time.h>
 #include <X11/Xlib.h>
+#include <X11/Xatom.h>
 
-// A utf-8 buffer containing the last thing pasted
-// to the CLIPBOARD X11 selection.
-static unsigned char *DATA = NULL;
+#define MAX_STORED 4
+
+typedef struct {
+	Atom type;
+	unsigned char *data;
+	unsigned long len;
+} StoredSelection;
+
+static StoredSelection stored[MAX_STORED];
+static int stored_count = 0;
 
 static Atom CLIPBOARD;
 static Atom UTF8_STRING;
+static Atom STRING;
+static Atom TARGETS;
+static Atom IMAGE_PNG;
 static Atom XCLIPD_PROPERTY;
 static Atom INCR;
 
@@ -33,15 +44,75 @@ char * now() {
 	return s;
 }
 
-void nab(Display *display, Window w) {
-	Window owner;
-	XEvent ev;
-	XSelectionEvent *sev;
+void clear_stored() {
+	for (int i = 0; i < stored_count; i++) {
+		if (stored[i].data) {
+			XFree(stored[i].data);
+			stored[i].data = NULL;
+		}
+	}
+	stored_count = 0;
+}
 
-	Atom da, type;
+StoredSelection *find_stored(Atom type) {
+	for (int i = 0; i < stored_count; i++) {
+		if (stored[i].type == type) return &stored[i];
+	}
+	/* Serve STRING requests from UTF8_STRING data */
+	if (type == STRING) {
+		for (int i = 0; i < stored_count; i++) {
+			if (stored[i].type == UTF8_STRING) return &stored[i];
+		}
+	}
+	return NULL;
+}
+
+/* Request a single format from the current clipboard owner and store it */
+int nab_type(Display *display, Window w, Atom target) {
+	XEvent ev;
+	Atom type;
 	int di;
 	unsigned long size, dul;
 	unsigned char *ignored = NULL;
+
+	XConvertSelection(display, CLIPBOARD, target, XCLIPD_PROPERTY, w, CurrentTime);
+	for (;;) {
+		XNextEvent(display, &ev);
+		if (ev.type != SelectionNotify) continue;
+
+		XSelectionEvent *sev = (XSelectionEvent *)&ev.xselection;
+		if (sev->property == None) return 0;
+
+		XGetWindowProperty(display, w, XCLIPD_PROPERTY, 0, 0, False, AnyPropertyType,
+		                   &type, &di, &dul, &size, &ignored);
+		XFree(ignored);
+		if (type == INCR) {
+			XDeleteProperty(display, w, XCLIPD_PROPERTY);
+			fprintf(stderr, "[%s] xclipd: data too large and INCR mechanism not implemented\n", now());
+			return 0;
+		}
+
+		unsigned char *data = NULL;
+		unsigned long nitems;
+		XGetWindowProperty(display, w, XCLIPD_PROPERTY, 0, size, False, AnyPropertyType,
+		                   &type, &di, &nitems, &dul, &data);
+		XDeleteProperty(display, w, XCLIPD_PROPERTY);
+
+		if (stored_count < MAX_STORED && data && nitems > 0) {
+			stored[stored_count].type = target;
+			stored[stored_count].data = data;
+			stored[stored_count].len = nitems;
+			stored_count++;
+			return 1;
+		}
+		if (data) XFree(data);
+		return 0;
+	}
+}
+
+void nab(Display *display, Window w) {
+	Window owner;
+	XEvent ev;
 
 	owner = XGetSelectionOwner(display, CLIPBOARD);
 	if (owner == None) {
@@ -50,72 +121,80 @@ void nab(Display *display, Window w) {
 		return;
 	}
 
-	XConvertSelection(display, CLIPBOARD, UTF8_STRING, XCLIPD_PROPERTY, w, CurrentTime);
+	clear_stored();
+
+	/* Ask the owner what formats it supports */
+	XConvertSelection(display, CLIPBOARD, TARGETS, XCLIPD_PROPERTY, w, CurrentTime);
+
+	Atom *targets = NULL;
+	unsigned long num_targets = 0;
+
 	for (;;) {
 		XNextEvent(display, &ev);
-		switch (ev.type) {
-		case SelectionNotify:
-			sev = (XSelectionEvent*)&ev.xselection;
-			if (sev->property != None) {
-				/* Dummy call to get type and size */
-				XGetWindowProperty(display, w, XCLIPD_PROPERTY, 0, 0, False, AnyPropertyType,
-				                   &type, &di, &dul, &size, &ignored);
-				XFree(ignored);
-				if (type == INCR) {
-					fprintf(stderr, "[%s] xclipd: data too large and INCR mechanism not implemented\n", now());
-					return;
-				}
+		if (ev.type != SelectionNotify) continue;
 
-				XFree(DATA);
-				XGetWindowProperty(display, w, XCLIPD_PROPERTY, 0, size, False, AnyPropertyType,
-				                   &da, &di, &dul, &dul, &DATA);
+		XSelectionEvent *sev = (XSelectionEvent *)&ev.xselection;
+		if (sev->property != None) {
+			Atom type;
+			int di;
+			unsigned long nitems, dul;
+			unsigned char *data = NULL;
 
-				/* Signal the selection owner that we have successfully read the data. */
-				XDeleteProperty(display, w, XCLIPD_PROPERTY);
+			XGetWindowProperty(display, w, XCLIPD_PROPERTY, 0, 1024, False, XA_ATOM,
+			                   &type, &di, &nitems, &dul, &data);
+			XDeleteProperty(display, w, XCLIPD_PROPERTY);
 
-				fprintf(stderr, "[%s] xclipd: taking on stewardship of %lu bytes on clipboard.\n", now(), strlen((const char *)DATA));
-				XSetSelectionOwner(display, CLIPBOARD, w, CurrentTime);
-				return;
-			} else {
-				fprintf(stderr, "[%s] xclipd: selection owner refused our request for clipboard contents!\n", now());
-				exit(1);
+			if (type == XA_ATOM && data) {
+				targets = (Atom *)data;
+				num_targets = nitems;
 			}
-			break;
 		}
+		break;
+	}
+
+	if (targets && num_targets > 0) {
+		/* Grab each format we care about */
+		Atom wanted[] = { IMAGE_PNG, UTF8_STRING };
+		int n_wanted = 2;
+
+		for (int i = 0; i < n_wanted; i++) {
+			for (unsigned long j = 0; j < num_targets; j++) {
+				if (targets[j] == wanted[i]) {
+					nab_type(display, w, wanted[i]);
+					break;
+				}
+			}
+		}
+		XFree(targets);
+	} else {
+		/* Fallback: owner doesn't support TARGETS, try UTF8_STRING directly */
+		nab_type(display, w, UTF8_STRING);
+	}
+
+	if (stored_count > 0) {
+		fprintf(stderr, "[%s] xclipd: taking stewardship of %d format(s)\n", now(), stored_count);
+		XSetSelectionOwner(display, CLIPBOARD, w, CurrentTime);
 	}
 }
 
 void deny(Display *display, XSelectionRequestEvent *sev) {
 	XSelectionEvent ssev;
-	char *an;
 
-	an = XGetAtomName(display, sev->target);
-	if (an) {
-		XFree(an);
-	}
-
-	/* All of these should match the values of the request. */
 	ssev.type = SelectionNotify;
 	ssev.requestor = sev->requestor;
 	ssev.selection = sev->selection;
 	ssev.target = sev->target;
-	ssev.property = None;  /* signifies "nope" */
+	ssev.property = None;
 	ssev.time = sev->time;
 
 	XSendEvent(display, sev->requestor, True, NoEventMask, (XEvent *)&ssev);
 }
 
-void fulfill(Display *display, XSelectionRequestEvent *sev, Atom UTF8_STRING) {
+void fulfill(Display *display, XSelectionRequestEvent *sev, StoredSelection *s) {
 	XSelectionEvent ssev;
-	char *an;
 
-	an = XGetAtomName(display, sev->property);
-	if (an) {
-		XFree(an);
-	}
-
-	XChangeProperty(display, sev->requestor, sev->property, UTF8_STRING, 8, PropModeReplace,
-	                DATA, strlen((const char *)DATA));
+	XChangeProperty(display, sev->requestor, sev->property, s->type, 8, PropModeReplace,
+	                s->data, s->len);
 
 	ssev.type = SelectionNotify;
 	ssev.requestor = sev->requestor;
@@ -127,7 +206,8 @@ void fulfill(Display *display, XSelectionRequestEvent *sev, Atom UTF8_STRING) {
 	XSendEvent(display, sev->requestor, True, NoEventMask, (XEvent *)&ssev);
 }
 
-void bailout() {
+void bailout(int sig, siginfo_t *info, void *ctx) {
+	(void)sig; (void)info; (void)ctx;
 	exit(0);
 }
 
@@ -153,9 +233,11 @@ int main() {
 	INCR            = XInternAtom(display, "INCR",        False);
 	CLIPBOARD       = XInternAtom(display, "CLIPBOARD",   False);
 	UTF8_STRING     = XInternAtom(display, "UTF8_STRING", False);
+	STRING          = XInternAtom(display, "STRING",      False);
+	TARGETS         = XInternAtom(display, "TARGETS",     False);
+	IMAGE_PNG       = XInternAtom(display, "image/png",   False);
 	XCLIPD_PROPERTY = XInternAtom(display, "XCLIPD",      False);
 
-	/* We need a window to receive messages from other clients. */
 	screen = DefaultScreen(display);
 	target_window = XCreateSimpleWindow(display, RootWindow(display, screen),
 	                                    -10, -10, 1, 1, 0, 0, 0);
@@ -172,13 +254,43 @@ int main() {
 
 		case SelectionRequest:
 			sev = (XSelectionRequestEvent*)&ev.xselectionrequest;
-			/* Property is set to None by "obsolete" clients. */
-			if (!DATA || sev->target != UTF8_STRING || sev->property == None) {
-				fprintf(stderr, "[%s] xclipd: denying (unfulfillable) request for clipboard data\n", now());
+
+			if (stored_count == 0 || sev->property == None) {
 				deny(display, sev);
+
+			} else if (sev->target == TARGETS) {
+				Atom tlist[MAX_STORED + 2];
+				int n = 0;
+				int has_string = 0, has_utf8 = 0;
+
+				tlist[n++] = TARGETS;
+				for (int i = 0; i < stored_count; i++) {
+					tlist[n++] = stored[i].type;
+					if (stored[i].type == STRING) has_string = 1;
+					if (stored[i].type == UTF8_STRING) has_utf8 = 1;
+				}
+				/* If we have UTF8_STRING, also advertise STRING */
+				if (has_utf8 && !has_string) tlist[n++] = STRING;
+
+				XChangeProperty(display, sev->requestor, sev->property, XA_ATOM, 32, PropModeReplace,
+				                (unsigned char *)tlist, n);
+
+				XSelectionEvent ssev;
+				ssev.type = SelectionNotify;
+				ssev.requestor = sev->requestor;
+				ssev.selection = sev->selection;
+				ssev.target = TARGETS;
+				ssev.property = sev->property;
+				ssev.time = sev->time;
+				XSendEvent(display, sev->requestor, True, NoEventMask, (XEvent *)&ssev);
+
 			} else {
-				fprintf(stderr, "[%s] xclipd: fulfilling request for clipboard data\n", now());
-				fulfill(display, sev, UTF8_STRING);
+				StoredSelection *s = find_stored(sev->target);
+				if (s) {
+					fulfill(display, sev, s);
+				} else {
+					deny(display, sev);
+				}
 			}
 			break;
 		}
