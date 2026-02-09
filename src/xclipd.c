@@ -3,10 +3,12 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
+#include <sys/select.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 
 #define MAX_STORED 4
+#define NAB_TIMEOUT_MS 500
 
 typedef struct {
 	Atom type;
@@ -16,6 +18,9 @@ typedef struct {
 
 static StoredSelection stored[MAX_STORED];
 static int stored_count = 0;
+
+static StoredSelection pending[MAX_STORED];
+static int pending_count = 0;
 
 static Atom CLIPBOARD;
 static Atom UTF8_STRING;
@@ -44,6 +49,22 @@ char * now() {
 	return s;
 }
 
+/* Wait for an X event with timeout. Returns 1 if event available, 0 on timeout. */
+int wait_for_event(Display *display, int timeout_ms) {
+	if (XPending(display) > 0) return 1;
+
+	int fd = ConnectionNumber(display);
+	fd_set fds;
+	struct timeval tv;
+
+	FD_ZERO(&fds);
+	FD_SET(fd, &fds);
+	tv.tv_sec = timeout_ms / 1000;
+	tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+	return select(fd + 1, &fds, NULL, NULL, &tv) > 0;
+}
+
 void clear_stored() {
 	for (int i = 0; i < stored_count; i++) {
 		if (stored[i].data) {
@@ -52,6 +73,16 @@ void clear_stored() {
 		}
 	}
 	stored_count = 0;
+}
+
+void clear_pending() {
+	for (int i = 0; i < pending_count; i++) {
+		if (pending[i].data) {
+			XFree(pending[i].data);
+			pending[i].data = NULL;
+		}
+	}
+	pending_count = 0;
 }
 
 StoredSelection *find_stored(Atom type) {
@@ -67,7 +98,7 @@ StoredSelection *find_stored(Atom type) {
 	return NULL;
 }
 
-/* Request a single format from the current clipboard owner and store it */
+/* Request a single format from the current clipboard owner and stage it in pending */
 int nab_type(Display *display, Window w, Atom target) {
 	XEvent ev;
 	Atom type;
@@ -77,6 +108,10 @@ int nab_type(Display *display, Window w, Atom target) {
 
 	XConvertSelection(display, CLIPBOARD, target, XCLIPD_PROPERTY, w, CurrentTime);
 	for (;;) {
+		if (!wait_for_event(display, NAB_TIMEOUT_MS)) {
+			fprintf(stderr, "[%s] xclipd: timeout waiting for selection data\n", now());
+			return 0;
+		}
 		XNextEvent(display, &ev);
 		if (ev.type != SelectionNotify) continue;
 
@@ -98,11 +133,11 @@ int nab_type(Display *display, Window w, Atom target) {
 		                   &type, &di, &nitems, &dul, &data);
 		XDeleteProperty(display, w, XCLIPD_PROPERTY);
 
-		if (stored_count < MAX_STORED && data && nitems > 0) {
-			stored[stored_count].type = target;
-			stored[stored_count].data = data;
-			stored[stored_count].len = nitems;
-			stored_count++;
+		if (pending_count < MAX_STORED && data && nitems > 0) {
+			pending[pending_count].type = target;
+			pending[pending_count].data = data;
+			pending[pending_count].len = nitems;
+			pending_count++;
 			return 1;
 		}
 		if (data) XFree(data);
@@ -121,7 +156,7 @@ void nab(Display *display, Window w) {
 		return;
 	}
 
-	clear_stored();
+	pending_count = 0;
 
 	/* Ask the owner what formats it supports */
 	XConvertSelection(display, CLIPBOARD, TARGETS, XCLIPD_PROPERTY, w, CurrentTime);
@@ -130,6 +165,10 @@ void nab(Display *display, Window w) {
 	unsigned long num_targets = 0;
 
 	for (;;) {
+		if (!wait_for_event(display, NAB_TIMEOUT_MS)) {
+			fprintf(stderr, "[%s] xclipd: timeout waiting for TARGETS\n", now());
+			break;
+		}
 		XNextEvent(display, &ev);
 		if (ev.type != SelectionNotify) continue;
 
@@ -171,9 +210,22 @@ void nab(Display *display, Window w) {
 		nab_type(display, w, UTF8_STRING);
 	}
 
-	if (stored_count > 0) {
+	if (pending_count > 0) {
+		/* Successfully fetched new data — replace old stored data */
+		clear_stored();
+		for (int i = 0; i < pending_count; i++)
+			stored[i] = pending[i];
+		stored_count = pending_count;
+		pending_count = 0;
 		fprintf(stderr, "[%s] xclipd: taking stewardship of %d format(s)\n", now(), stored_count);
 		XSetSelectionOwner(display, CLIPBOARD, w, CurrentTime);
+	} else {
+		/* Nab failed — keep previous data if we have any */
+		clear_pending();
+		if (XGetSelectionOwner(display, CLIPBOARD) == None && stored_count > 0) {
+			fprintf(stderr, "[%s] xclipd: nab failed, reclaiming with previous data\n", now());
+			XSetSelectionOwner(display, CLIPBOARD, w, CurrentTime);
+		}
 	}
 }
 
