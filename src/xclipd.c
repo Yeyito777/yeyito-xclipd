@@ -6,6 +6,7 @@
 #include <sys/select.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/extensions/Xfixes.h>
 
 #define MAX_STORED 4
 #define NAB_TIMEOUT_MS 500
@@ -294,14 +295,34 @@ int main() {
 	target_window = XCreateSimpleWindow(display, RootWindow(display, screen),
 	                                    -10, -10, 1, 1, 0, 0, 0);
 
+	int xfixes_event_base, xfixes_error_base;
+	if (!XFixesQueryExtension(display, &xfixes_event_base, &xfixes_error_base)) {
+		fprintf(stderr, "[%s] xclipd: XFixes extension not available\n", now());
+		return 1;
+	}
+	XFixesSelectSelectionInput(display, target_window, CLIPBOARD,
+	                           XFixesSetSelectionOwnerNotifyMask);
+
 	nab(display, target_window);
 
 	for (;;) {
 		XNextEvent(display, &ev);
+
+		if (ev.type == xfixes_event_base + XFixesSelectionNotify) {
+			XFixesSelectionNotifyEvent *fev = (XFixesSelectionNotifyEvent *)&ev;
+			if (fev->owner != target_window && fev->owner != None) {
+				fprintf(stderr, "[%s] xclipd: clipboard taken by another process; nabbing...\n", now());
+				nab(display, target_window);
+			} else if (fev->owner == None && stored_count > 0) {
+				fprintf(stderr, "[%s] xclipd: clipboard became unowned; reclaiming...\n", now());
+				XSetSelectionOwner(display, CLIPBOARD, target_window, CurrentTime);
+			}
+			continue;
+		}
+
 		switch (ev.type) {
 		case SelectionClear:
-			fprintf(stderr, "[%s] xclipd: lost control of the clipboard; regaining...\n", now());
-			nab(display, target_window);
+			/* Handled by XFixes above; just ignore */
 			break;
 
 		case SelectionRequest:

@@ -1,5 +1,5 @@
 xclipd: src/xclipd.c
-	$(CC) -Wall -Wextra -o $@ $< -lX11
+	$(CC) -Wall -Wextra -o $@ $< -lX11 -lXfixes
 
 install: xclipd
 	install -Dm755 xclipd ~/.local/bin/xclipd
